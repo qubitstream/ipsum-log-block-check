@@ -46,6 +46,7 @@ import urllib.request
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import ModuleType
 from typing import Iterable, Iterator, NamedTuple
 
 # fmt: off
@@ -74,13 +75,13 @@ SearchTerm = NamedTuple(
 
 IPMatch = NamedTuple("IPMatch", [("ip", str), ("line", str)])
 
-SUFFIXES_TO_MODULE = {
+SUFFIXES_TO_MODULE: dict[tuple[str], ModuleType] = {
     (".bz2",): bz2,
     (".gz",): gzip,
     (".lzma",): lzma,
 }
 
-SUPPORTED_COMPRESSION_SUFFIXES = set(
+SUPPORTED_COMPRESSION_SUFFIXES: set[str] = set(
     suffix for suffixes in SUFFIXES_TO_MODULE.keys() for suffix in suffixes
 )
 
@@ -166,7 +167,7 @@ def get_lines(text_file_path: Path, encoding: str = "utf-8") -> Iterator[str]:
     Yields:
         Iterator[str]: Iterator of lines
     """
-    module = None
+    module: ModuleType | None = None
     lower_suffix = text_file_path.suffix.lower()
     for suffixes, module_for_suffixes in SUFFIXES_TO_MODULE.items():
         if lower_suffix in suffixes:
@@ -205,7 +206,7 @@ def get_text_file_paths(
     if not isinstance(text_file_path, Iterable):
         text_file_path = [text_file_path]
 
-    result_paths = []
+    result_paths: list[Path] = []
 
     for text_file_path in text_file_path:
         # Look for older log files (compressed or not)
@@ -275,7 +276,7 @@ def get_ip_matches(
             )
 
     for line in lines:
-        ips_found = IP4_REGEX.findall(line)
+        ips_found: list[str] = IP4_REGEX.findall(line)
 
         # skip line if no IP found at index
         if len(ips_found) < n_th_ip_abs:
@@ -542,9 +543,9 @@ def main() -> None:
         (terminal_width - output_string_min_length - 1) if terminal_width else None
     )
 
-    all_ips = []
-    blocked_ips = []
-    unblocked_ips = []
+    all_ips: list[str] = []
+    blocked_ips: list[str] = []
+    unblocked_ips: list[str] = []
     for ip_match in ip_matches:
         all_ips.append(ip_match.ip)
 
