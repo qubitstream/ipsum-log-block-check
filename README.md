@@ -4,7 +4,7 @@ IPsum Log Block Check
 A Python script to scan log files for IPv4 addresses and determine whether they appear on the [IPsum block list](https://github.com/stamparm/ipsum).
 
 Useful for analyzing access logs or security event logs to identify potentially malicious IP addresses and evaluate how the IPsum blocklist at the given level would block those
-(by using for example [ufw-blocklist](https://github.com/poddmo/ufw-blocklist))
+(for example by using [ufw-blocklist](https://github.com/poddmo/ufw-blocklist))
 
 ## Features
 
@@ -26,7 +26,29 @@ Useful for analyzing access logs or security event logs to identify potentially 
 
 ## Installation
 
-Clone the repo:
+### 1. As a command on UNIX, available system wide for all users
+
+Clone the repo to `/opt/ipsum-log-block-check`, then create a symlink in `/usr/local/bin/ipsum_log_block_check.py`
+
+Any user can the run `ipsum_log_block_check.py`, which should be available in PATH.
+
+Of course, some python interpreter must be available.
+
+#### Installation
+
+```shell
+sudo git clone https://github.com/qubitstream/ipsum-log-block-check.git /opt/ipsum-log-block-check && sudo chmod 755 /opt/ipsum-log-block-check/ipsum_log_block_check.py && sudo ln -s /opt/ipsum-log-block-check/ipsum_log_block_check.py /usr/local/bin/ipsum_log_block_check.py
+```
+
+#### Update
+
+```
+sudo git -C /opt/ipsum-log-block-check checkout -- ipsum_log_block_check.py && git -C /opt/ipsum-log-block-check pull origin master && sudo chmod 755 /opt/ipsum-log-block-check/ipsum_log_block_check.py
+```
+
+### 2. As simple local script
+
+Just clone the repo to a directory of your choice:
 
 ```shell
 git clone https://github.com/qubitstream/ipsum-log-block-check.git
