@@ -61,6 +61,8 @@ IP4_REGEX = re.compile(
 )
 # fmt: on
 
+TAB_REGEX = re.compile(r"\t+")
+
 IPSET_URL_FORMAT_STR = "https://raw.githubusercontent.com/stamparm/ipsum/refs/heads/master/levels/{level}.txt"
 
 
@@ -566,7 +568,10 @@ def main() -> None:
                 "{0:>7} | {1:<15} | {2}".format(
                     "BLOCKED" if is_blocked else "OK",
                     ip_match.ip,
-                    fit_line_with_ellipsis(ip_match.line, max_width=width_available),
+                    fit_line_with_ellipsis(
+                        line=TAB_REGEX.sub(" ", ip_match.line),
+                        max_width=width_available,
+                    ),
                 )
             )
 
