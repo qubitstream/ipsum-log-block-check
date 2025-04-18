@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import bz2
 import enum
+import getpass
 import gzip
 import lzma
 import os
@@ -473,7 +474,9 @@ def main() -> None:
     tempdir_path = Path(tempfile.gettempdir())
     ipsum_block_file_path = (
         tempdir_path
-        / f"ipsum_log_block_check__ipsum_blocked_ips__level_{args.ipsum_level}.txt"
+        / "ipsum_log_block_check"
+        / getpass.getuser()
+        / f"ipsum_blocked_ips__level_{args.ipsum_level}.txt"
     )
     ipsum_datetime: datetime | None = None
 
@@ -486,6 +489,8 @@ def main() -> None:
             )
             ipsum_datetime = datetime.now()
             try:
+                if not ipsum_block_file_path.parent.is_dir():
+                    ipsum_block_file_path.parent.mkdir(parents=True)
                 ipsum_block_file_path.write_text(
                     ipsum_blocked_ips_text, encoding="utf-8"
                 )
