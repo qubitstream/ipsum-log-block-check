@@ -476,8 +476,7 @@ def main() -> None:
     tempdir_path = Path(tempfile.gettempdir())
     ipsum_block_file_path = (
         tempdir_path
-        / "ipsum_log_block_check"
-        / getpass.getuser()
+        / f"ipsum_log_block_check__{getpass.getuser()}"
         / f"ipsum_blocked_ips__level_{args.ipsum_level}.txt"
     )
     ipsum_datetime: datetime | None = None
