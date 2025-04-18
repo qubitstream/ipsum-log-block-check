@@ -590,11 +590,11 @@ def main() -> None:
     print(f"IPsum list cache file: {ipsum_block_file_path}")
     print(f"IPsum list date: {ipsum_datetime.isoformat() if ipsum_datetime else '-'}")
 
-    print("Log file(s) parsed:")
+    print(f"Log file(s) parsed ({len(text_file_paths)}):")
     for i, text_file_path in enumerate(text_file_paths, start=1):
         print(f"{i:>4}. {text_file_path.resolve()}")
 
-    print(f"Looking at IP at position {args.n_th_ip} in each line")
+    print(f"Looking at IP number {args.n_th_ip} in each line")
 
     print("Search term(s):")
     if search_terms:
@@ -616,22 +616,28 @@ def main() -> None:
         if args.top_n > 0:
             print()
             print(f"__________ Top {args.top_n} total IPs __________")
-            for place, (ip, count) in enumerate(
-                Counter(all_ips).most_common(args.top_n), start=1
-            ):
-                print(f"{place:>2}. | {ip:<15} | {count}x")
+            most_common_total_ips = Counter(all_ips).most_common(args.top_n)
+            if most_common_total_ips:
+                for place, (ip, count) in enumerate(most_common_total_ips, start=1):
+                    print(f"{place:>2}. | {ip:<15} | {count}x")
+            else:
+                print("(no IPs found)")
 
             print(f"__________ Top {args.top_n} unblocked IPs __________")
-            for place, (ip, count) in enumerate(
-                Counter(unblocked_ips).most_common(args.top_n), start=1
-            ):
-                print(f"{place:>2}. | {ip:<15} | {count}x")
+            most_common_unblocked_ips = Counter(unblocked_ips).most_common(args.top_n)
+            if most_common_unblocked_ips:
+                for place, (ip, count) in enumerate(most_common_unblocked_ips, start=1):
+                    print(f"{place:>2}. | {ip:<15} | {count}x")
+            else:
+                print("(no IPs found)")
 
             print(f"__________ Top {args.top_n} blocked IPs __________")
-            for place, (ip, count) in enumerate(
-                Counter(blocked_ips).most_common(args.top_n), start=1
-            ):
-                print(f"{place:>2}. | {ip:<15} | {count}x")
+            most_common_blocked_ips = Counter(blocked_ips).most_common(args.top_n)
+            if most_common_blocked_ips:
+                for place, (ip, count) in enumerate(most_common_blocked_ips, start=1):
+                    print(f"{place:>2}. | {ip:<15} | {count}x")
+            else:
+                print("(no IPs found)")
             print()
 
         print("__________ Results __________")
@@ -639,12 +645,12 @@ def main() -> None:
             f"Using IPsum list level {args.ipsum_level} ({len(ipsum_blocked_ips)} IPs):"
         )
         print(
-            f"{blocked_count / all_count: >7.2%} entries would be blocked "
+            f"  {blocked_count / all_count: >7.2%} entries would be blocked "
             f"({blocked_count} out of {all_count}, "
             f"unblocked: {unblocked_count})"
         )
         print(
-            f"{unique_blocked_count / all_unique_count: >7.2%} unique IPs "
+            f"  {unique_blocked_count / all_unique_count: >7.2%} unique IPs "
             f"would be blocked "
             f"({unique_blocked_count} out of {all_unique_count}, "
             f"unblocked: {unique_unblocked_count})"

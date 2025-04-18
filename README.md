@@ -53,10 +53,10 @@ __________ Params __________
 IPsum list level 2 (containing 25363 IPs)
 IPsum list cache file: /tmp/ipsum_log_block_check__ipsum_blocked_ips__level_2.txt
 IPsum list date: 2025-04-18T00:37:23.219933
-Log file(s) parsed:
+Log file(s) parsed (2):
    1. /var/log/nginx/access.log.1
    2. /var/log/nginx/access.log
-Looking at IP at position 1 in each line
+Looking at IP number 1 in each line
 Search term(s):
    1. +   case sensitive: POST
 
@@ -81,9 +81,8 @@ __________ Top 5 blocked IPs __________
 
 __________ Results __________
 Using IPsum list level 2 (25363 IPs):
- 49.45% entries would be blocked (1265 out of 2558, unblocked: 1293)
- 63.33% unique IPs would be blocked (342 out of 540, unblocked: 198)
-
+   49.45% entries would be blocked (1265 out of 2558, unblocked: 1293)
+   63.33% unique IPs would be blocked (342 out of 540, unblocked: 198)
 ```
 
 ### Complex example
