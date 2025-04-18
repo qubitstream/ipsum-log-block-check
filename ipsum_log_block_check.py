@@ -479,16 +479,36 @@ def main() -> None:
         / f"ipsum_log_block_check__{getpass.getuser()}"
         / f"ipsum_blocked_ips__level_{args.ipsum_level}.txt"
     )
-    ipsum_datetime: datetime | None = None
 
-    try:
-        if not ipsum_block_file_path.is_file() or is_file_older_than(
-            file_path=ipsum_block_file_path, delta=timedelta(minutes=args.ipsum_max_age)
-        ):
+    ipsum_datetime: datetime | None = None
+    ipsum_list_needs_download = False
+    ipsum_blocked_ips_text = ""
+
+    if ipsum_block_file_path.is_file() and not is_file_older_than(
+        file_path=ipsum_block_file_path, delta=timedelta(minutes=args.ipsum_max_age)
+    ):
+        try:
+            ipsum_blocked_ips_text = ipsum_block_file_path.read_text(encoding="utf-8")
+            ipsum_datetime = datetime.fromtimestamp(
+                ipsum_block_file_path.stat().st_mtime
+            )
+        except Exception as e:
+            ipsum_list_needs_download = True
+            print(
+                f"Failed to read cache file {ipsum_block_file_path}: {e}",
+                file=sys.stderr,
+            )
+    else:
+        ipsum_list_needs_download = True
+
+    if ipsum_list_needs_download:
+        try:
+            # Download list
             ipsum_blocked_ips_text = download_textfile(
                 IPSET_URL_FORMAT_STR.format(level=args.ipsum_level)
             )
             ipsum_datetime = datetime.now()
+            # Try to save list to cache file
             try:
                 if not ipsum_block_file_path.parent.is_dir():
                     ipsum_block_file_path.parent.mkdir(parents=True)
@@ -496,21 +516,35 @@ def main() -> None:
                     ipsum_blocked_ips_text, encoding="utf-8"
                 )
             except OSError:
+                # Not a deal-breaker, we just use the downloaded list in memory
                 print(
                     f"Failed to write cache file to {ipsum_block_file_path}",
                     file=sys.stderr,
                 )
-        else:
-            ipsum_blocked_ips_text = ipsum_block_file_path.read_text(encoding="utf-8")
-            ipsum_datetime = datetime.fromtimestamp(
-                ipsum_block_file_path.stat().st_mtime
-            )
+        except Exception as e:
+            print(f"Failed to get IPsum block list: {e}", file=sys.stderr)
+            sys.exit(1)
 
-        ipsum_blocked_ips = set(ipsum_blocked_ips_text.split())
+    # Build the block list and ensure it is valid
+    ipsum_blocked_ips: set[str] = set()
+    try:
+        for line_nr, line in enumerate(ipsum_blocked_ips_text.split(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            if not line.startswith("#") and IP4_REGEX.fullmatch(line):
+                ipsum_blocked_ips.add(line)
+            else:
+                print(
+                    f"IPsum block list contains invalid IP address at line #{line_nr}: {line}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
     except Exception as e:
-        print(f"Failed to get IPsum block list: {e}", file=sys.stderr)
+        print(f"Failed to parse IPsum block list: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Get text file paths
     text_file_paths = get_text_file_paths(
         args.input_file,
         older_logs_upto_n=args.older_logs_up_to_n,
