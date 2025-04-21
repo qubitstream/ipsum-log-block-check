@@ -38,17 +38,25 @@ import bz2
 import enum
 import getpass
 import gzip
+import json
 import lzma
 import os
+import platform
 import re
+import socket
 import sys
 import tempfile
 import urllib.request
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 from types import ModuleType
-from typing import Iterable, Iterator, NamedTuple
+from typing import Any, Iterable, Iterator, NamedTuple, Optional, Union
+
+__version__ = "0.1.1"
+
 
 # fmt: off
 IP4_REGEX = re.compile(
@@ -57,7 +65,7 @@ IP4_REGEX = re.compile(
         r"(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"  # First three octets: 0-255
         r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"           # Last octet: 0-255
     r")"
-    r"(?!\d)"                                            # Negative lookahead: no digit 
+    r"(?!\d)"                                            # Negative lookahead: no digit
 )
 # fmt: on
 
@@ -176,6 +184,7 @@ def get_lines(text_file_path: Path, encoding: str = "utf-8") -> Iterator[str]:
         if lower_suffix in suffixes:
             module = module_for_suffixes
             break
+
     try:
         if module is not None:
             with module.open(text_file_path, "rt", encoding=encoding) as f:
@@ -189,7 +198,7 @@ def get_lines(text_file_path: Path, encoding: str = "utf-8") -> Iterator[str]:
         print(f"Failed to read {text_file_path}: {e}", file=sys.stderr)
 
 
-def get_text_file_paths(
+def detect_text_file_paths(
     text_file_path: Path | Iterable[Path],
     older_logs_upto_n: int | None = None,
     sort_by_mtime: bool = True,
@@ -236,6 +245,101 @@ def get_text_file_paths(
         result_paths = sorted(result_paths, key=lambda p: p.stat().st_mtime)
 
     return result_paths
+
+
+def text_to_ip_set(text: str) -> set[str]:
+    """Extract IP addresses from text, line by line
+
+    Args:
+        text (str): text string with lines of IPs
+
+    Raises:
+        ValueError: Invalid IP address
+        ValueError: File could not be read
+
+    Returns:
+        set[str]: a set of IP4 addresses as strings
+    """
+    blocked_ips: set[str] = set()
+    try:
+        for line_nr, line in enumerate(text.split(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            if not line.startswith("#") and IP4_REGEX.fullmatch(line):
+                blocked_ips.add(line)
+            else:
+                raise ValueError(
+                    f"IPsum block list contains invalid IP address at line #{line_nr}: {line}"
+                )
+        return blocked_ips
+    except Exception as e:
+        raise ValueError(f"Failed to parse block list: {e}")
+
+
+def get_ipsum_blocklist(
+    level: int = 1, cached_max_age: timedelta = timedelta(minutes=60)
+) -> tuple[set[str], datetime | None, Path | None]:
+    """Download or read cached IPsum block list set
+
+    Args:
+        level (int, optional): IPsum level. Defaults to 1.
+        cached_max_age (timedelta, optional): max age of cache
+            Defaults to timedelta(minutes=60).
+
+    Returns:
+        tuple[str, datetime | None, Path | None]: Returns a tuple:
+            - set with IPs from the IPsum block list
+            - datetime of the IPsum data (cache file or download)
+            - path to the IPsum cache file (if used)
+    """
+    tempdir_path = Path(tempfile.gettempdir())
+    cache_file_path = (
+        tempdir_path
+        / f"ipsum_log_block_check__{getpass.getuser()}"
+        / f"ipsum_blocked_ips__level_{level}.txt"
+    )
+
+    content_datetime: datetime | None = None
+    needs_download = False
+    content = ""
+
+    if cache_file_path.is_file() and not is_file_older_than(
+        file_path=cache_file_path, delta=cached_max_age
+    ):
+        try:
+            content = cache_file_path.read_text(encoding="utf-8")
+            content_datetime = datetime.fromtimestamp(
+                cache_file_path.stat().st_mtime, tz=timezone.utc
+            )
+        except Exception as e:
+            needs_download = True
+            print(
+                f"Failed to read cache file {cache_file_path}: {e}",
+                file=sys.stderr,
+            )
+    else:
+        needs_download = True
+
+    if needs_download:
+        content = download_textfile(IPSET_URL_FORMAT_STR.format(level=level))
+        content_datetime = datetime.now(timezone.utc)
+
+        # Try to save list to cache file
+        try:
+            if not cache_file_path.parent.is_dir():
+                cache_file_path.parent.mkdir(parents=True)
+            cache_file_path.write_text(content, encoding="utf-8")
+        except OSError:
+            # Not a deal-breaker, we just use the downloaded list in memory
+            print(
+                f"Failed to write cache file to {cache_file_path}",
+                file=sys.stderr,
+            )
+            cache_file_path = None
+
+    ip_set = text_to_ip_set(content)
+    return ip_set, content_datetime, cache_file_path
 
 
 def get_ip_matches(
@@ -309,24 +413,434 @@ def get_ip_matches(
             yield IPMatch(ip=ips_found[ip_index], line=line)
 
 
+def build_search_terms(
+    include_term_case_insensitive: Iterable[str] | None,
+    include_term_case_sensitive: Iterable[str] | None,
+    exclude_term_case_insensitive: Iterable[str] | None,
+    exclude_term_case_sensitive: Iterable[str] | None,
+) -> set[SearchTerm]:
+    search_terms: set[SearchTerm] = set()
+    terms_data = (
+        (include_term_case_insensitive, SearchTermKind.INCLUDE, False),
+        (include_term_case_sensitive, SearchTermKind.INCLUDE, True),
+        (exclude_term_case_insensitive, SearchTermKind.EXCLUDE, False),
+        (exclude_term_case_sensitive, SearchTermKind.EXCLUDE, True),
+    )
+    for terms, kind, case_sensitive in terms_data:
+        for term in terms or []:
+            search_terms.add(
+                SearchTerm(term=term, kind=kind, case_sensitive=case_sensitive)
+            )
+    return search_terms
+
+
 def do_search(
-    text_file_paths: Path | Iterable[Path],
-    search_terms: Iterable[SearchTerm] | None,
+    text_file_paths: Iterable[Path],
+    search_terms: Optional[Iterable[SearchTerm]],
     n_th_ip: int = 1,
     encoding: str = "utf-8",
+    max_workers: int | None = 1,
 ) -> Iterator[IPMatch]:
-    search_terms = set(search_terms or [])
+    search_terms_set: set[SearchTerm] = set(search_terms or [])
+    input_paths: list[Path] = list(text_file_paths)
 
-    if not isinstance(text_file_paths, Iterable):
-        text_file_paths = [text_file_paths]
+    if max_workers is None:
+        max_workers = (os.cpu_count() or 1) + 4
+    max_workers = min(len(input_paths), 32, max_workers)
 
-    for text_file_path in text_file_paths:
-        for ip_match in get_ip_matches(
-            lines=get_lines(text_file_path=text_file_path, encoding=encoding),
-            search_terms=search_terms,
-            n_th_ip=n_th_ip,
-        ):
-            yield ip_match
+    if max_workers <= 1 or len(input_paths) <= 1:
+        for path in input_paths:
+            yield from get_ip_matches(
+                lines=get_lines(path, encoding),
+                search_terms=search_terms_set,
+                n_th_ip=n_th_ip,
+            )
+        return
+
+    task_queue: "Queue[Optional[Path]]" = Queue()
+    result_queue: "Queue[Union[IPMatch, object]]" = Queue()
+    sentinel: object = object()
+
+    # fill task queue with paths, then add sentinels
+    for path in input_paths:
+        task_queue.put(path)
+    for _ in range(max_workers):
+        task_queue.put(None)
+
+    def worker() -> None:
+        while True:
+            path = task_queue.get()
+            if path is None:
+                break
+            for match in get_ip_matches(
+                lines=get_lines(path, encoding),
+                search_terms=search_terms_set,
+                n_th_ip=n_th_ip,
+            ):
+                result_queue.put(match)
+        result_queue.put(sentinel)
+
+    for _ in range(max_workers):
+        Thread(target=worker, daemon=True).start()
+
+    finished = 0
+    while finished < max_workers:
+        item = result_queue.get()
+        if item is sentinel:
+            finished += 1
+        else:
+            yield item  # type: ignore[union-attr]  # item is IPMatch
+
+
+class BlockListSearch:
+    def __init__(
+        self,
+        input_file: Path | Iterable[Path],
+        encoding: str = "utf-8",
+        older_logs_up_to_n: int = 0,
+        process_by_mtime: bool = False,
+        include_term_case_insensitive: Iterable[str] | None = None,
+        include_term_case_sensitive: Iterable[str] | None = None,
+        exclude_term_case_insensitive: Iterable[str] | None = None,
+        exclude_term_case_sensitive: Iterable[str] | None = None,
+        n_th_ip: int = 1,
+        ipsum_level: int = 1,
+        ipsum_max_age: int = 60,
+        no_ok: bool = False,
+        no_blocked: bool = False,
+        top_n: int = 5,
+    ):
+        # Input files
+        self.input_file = input_file
+        self.encoding = encoding
+        self.older_logs_up_to_n = older_logs_up_to_n
+        self.process_by_mtime = process_by_mtime
+
+        self.input_paths: list[Path] = []
+
+        # Search stuff
+        self.include_term_case_insensitive = include_term_case_insensitive or []
+        self.include_term_case_sensitive = include_term_case_sensitive or []
+        self.exclude_term_case_insensitive = exclude_term_case_insensitive or []
+        self.exclude_term_case_sensitive = exclude_term_case_sensitive or []
+        self.n_th_ip = n_th_ip
+
+        self.search_terms: set[SearchTerm] = set()
+
+        # Blocklist
+        self.ipsum_level = ipsum_level
+        self.ipsum_max_age_minutes = ipsum_max_age
+
+        self.ipsum_datetime: datetime | None = None
+        self.ipsum_cache_file: Path | None = None
+
+        # Output control
+        self.no_ok = no_ok
+        self.no_blocked = no_blocked
+        self.top_n = top_n
+
+        self.blacklisted_ips: set[str] = set()
+        self.all_ips: list[str] = []
+        self.blocked_ips: list[str] = []
+        self.unblocked_ips: list[str] = []
+        self.run_at: datetime | None = None
+
+    def get_blacklisted_ips(self) -> set[str]:
+        ip_set, self.ipsum_datetime, self.ipsum_cache_file = get_ipsum_blocklist(
+            level=self.ipsum_level,
+            cached_max_age=timedelta(minutes=self.ipsum_max_age_minutes),
+        )
+        return ip_set
+
+    def parse(self, threads: int | None = 1) -> None:
+        try:
+            self.blacklisted_ips = self.get_blacklisted_ips()
+        except Exception as e:
+            print(
+                f"Failed to parse block list: {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        self.input_paths = detect_text_file_paths(
+            text_file_path=self.input_file,
+            older_logs_upto_n=self.older_logs_up_to_n,
+            sort_by_mtime=self.process_by_mtime,
+        )
+        if not self.input_paths:
+            print("No suitable input files found", file=sys.stderr)
+            sys.exit(1)
+
+        self.search_terms = build_search_terms(
+            include_term_case_insensitive=self.include_term_case_insensitive,
+            include_term_case_sensitive=self.include_term_case_sensitive,
+            exclude_term_case_insensitive=self.exclude_term_case_insensitive,
+            exclude_term_case_sensitive=self.exclude_term_case_sensitive,
+        )
+
+        self.all_ips = []
+        self.blocked_ips = []
+        self.unblocked_ips = []
+
+        self.run_at = datetime.now(timezone.utc)
+
+        ip_matches = do_search(
+            text_file_paths=self.input_paths,
+            search_terms=self.search_terms,
+            n_th_ip=self.n_th_ip,
+            encoding=self.encoding,
+            max_workers=threads,
+        )
+
+        self.process_matches(ip_matches)
+
+    def process_matches(self, ip_matches: Iterator[IPMatch]) -> None:
+        """Process single IPMatch object"""
+        output_string_min_length = 28
+        try:
+            terminal_width = os.get_terminal_size().columns
+        except OSError:
+            terminal_width = None
+        width_available = (
+            (terminal_width - output_string_min_length - 1) if terminal_width else None
+        )
+
+        for ip_match in ip_matches:
+            self.all_ips.append(ip_match.ip)
+
+            is_blocked = ip_match.ip in self.blacklisted_ips
+            if is_blocked:
+                self.blocked_ips.append(ip_match.ip)
+            else:
+                self.unblocked_ips.append(ip_match.ip)
+
+            omit_print = (is_blocked and self.no_blocked) or (
+                not is_blocked and self.no_ok
+            )
+            if not omit_print:
+                print(
+                    "{0:>7} | {1:<15} | {2}".format(
+                        "BLOCKED" if is_blocked else "OK",
+                        ip_match.ip,
+                        fit_line_with_ellipsis(
+                            line=TAB_REGEX.sub(" ", ip_match.line),
+                            max_width=width_available,
+                        ),
+                    )
+                )
+
+    @staticmethod
+    def process_to_json_compatible(obj: Any) -> Any:
+        if isinstance(obj, (str, int, float, bool, list, dict, type(None))):
+            return obj
+        if isinstance(obj, timedelta):
+            return obj.total_seconds()
+        if isinstance(obj, datetime):
+            return obj.astimezone().isoformat()
+        elif isinstance(obj, Path):
+            return str(obj.resolve())
+        elif isinstance(obj, set):
+            return sorted(obj)
+        elif isinstance(obj, SearchTerm):
+            return obj._asdict()
+        elif isinstance(obj, SearchTermKind):
+            return obj.value
+        elif isinstance(obj, tuple):
+            return list(obj)
+        else:
+            return str(obj)
+
+    def get_result_as_dict(self) -> dict[str, Any]:
+        unique_ips = set(self.all_ips)
+        unique_blocked_ips = set(self.blocked_ips)
+        unique_unblocked_ips = set(self.unblocked_ips)
+        data = {
+            "params": {
+                "input_file": self.input_file,
+                "older_logs_up_to_n": self.older_logs_up_to_n,
+                "process_by_mtime": self.process_by_mtime,
+                "include_term_case_insensitive": self.include_term_case_insensitive,
+                "include_term_case_sensitive": self.include_term_case_sensitive,
+                "exclude_term_case_insensitive": self.exclude_term_case_insensitive,
+                "exclude_term_case_sensitive": self.exclude_term_case_sensitive,
+                "n_th_ip": self.n_th_ip,
+                "ipsum_level": self.ipsum_level,
+                "ipsum_max_age_minutes": self.ipsum_max_age_minutes,
+                "no_ok": self.no_ok,
+                "no_blocked": self.no_blocked,
+                "top_n": self.top_n,
+            },
+            "processed": {
+                "hostname": socket.gethostname(),
+                "user": getpass.getuser(),
+                "platform": platform.platform(),
+                "run_at": self.run_at if self.run_at else None,
+                "input_paths": self.input_paths,
+                "search_terms": self.search_terms,
+                "blacklisted_ips": self.blacklisted_ips,
+                "blacklisted_count": len(self.blacklisted_ips),
+                "ipsum_datetime": self.ipsum_datetime,
+                "ipsum_cache_file": self.ipsum_cache_file,
+            },
+            "results": {
+                "entries": {
+                    "total": self.all_ips,
+                    "total_count": len(self.all_ips),
+                    "blocked": self.blocked_ips,
+                    "blocked_count": len(self.blocked_ips),
+                    "unblocked": self.unblocked_ips,
+                    "unblocked_count": len(self.unblocked_ips),
+                    "blocked_ratio": (len(self.blocked_ips) / len(self.all_ips))
+                    if self.all_ips
+                    else None,
+                },
+                "ips": {
+                    "total": unique_ips,
+                    "total_count": len(unique_ips),
+                    "blocked": unique_blocked_ips,
+                    "blocked_count": len(unique_blocked_ips),
+                    "unblocked": unique_unblocked_ips,
+                    "unblocked_count": len(unique_unblocked_ips),
+                    "blocked_ratio": (len(unique_blocked_ips) / len(unique_ips))
+                    if unique_ips
+                    else None,
+                    "top": {
+                        "n": self.top_n,
+                        "total": [],
+                        "blocked": [],
+                        "unblocked": [],
+                    },
+                },
+            },
+        }
+
+        if self.top_n > 0:
+            for key, dataset in (
+                ("total", self.all_ips),
+                ("unblocked", self.unblocked_ips),
+                ("blocked", self.blocked_ips),
+            ):
+                most_common = Counter(dataset).most_common(self.top_n)
+                data["results"]["ips"]["top"][key] = [
+                    {"ip": ip, "count": count} for ip, count in most_common
+                ]
+
+        return data
+
+    def get_result_as_json(self, ensure_ascii=True, no_ips: bool = True) -> str:
+        data = self.get_result_as_dict()
+
+        # Remove potentially massive IP lists
+        if no_ips:
+            data["processed"]["blacklisted_ips"] = None
+            for key in ["total", "blocked", "unblocked"]:
+                data["results"]["entries"][key] = None
+                data["results"]["ips"][key] = None
+        data["processed"]["search_terms"] = [
+            search_term._asdict() for search_term in data["processed"]["search_terms"]
+        ]
+
+        return json.dumps(
+            data,
+            indent=4,
+            ensure_ascii=ensure_ascii,
+            default=BlockListSearch.process_to_json_compatible,
+        )
+
+    def get_result_as_str(self) -> str:
+        data = self.get_result_as_dict()
+
+        # Alias variables for readability
+        params = data["params"]
+        processed = data["processed"]
+        entries = data["results"]["entries"]
+        ips = data["results"]["ips"]
+
+        lines = [""]
+        lines += [
+            "__________ Params __________",
+            f"IPsum list level {params['ipsum_level']} "
+            f"(containing {processed['blacklisted_count']} IPs)",
+            f"IPsum list cache file: {processed['ipsum_cache_file']}",
+            f"IPsum list date: {processed['ipsum_datetime'].isoformat() if processed['ipsum_datetime'] else '-'}",
+            f"Log file(s) parsed ({len(processed['input_paths'])}):",
+        ]
+        for i, input_file_path in enumerate(processed["input_paths"], start=1):
+            lines.append(f"{i:>4}. {input_file_path.resolve()}")
+
+        lines += [
+            f"Looking at IP number {params['n_th_ip']} in each line",
+            "Search term(s):",
+        ]
+        if processed["search_terms"]:
+            for i, search_term in enumerate(processed["search_terms"], start=1):
+                lines.append(
+                    "{0:>4}. {1} {2:>16}: {3}".format(
+                        i,
+                        "+" if search_term.kind == SearchTermKind.INCLUDE else "-",
+                        "case sensitive"
+                        if search_term.case_sensitive
+                        else "case insensitive",
+                        search_term.term,
+                    )
+                )
+        else:
+            lines.append("(no search terms given)")
+
+        if ips["total_count"]:
+            if params["top_n"] > 0:
+                lines.append("")
+                for key in ("total", "unblocked", "blocked"):
+                    lines.append(
+                        f"__________ Top {params['top_n']} {key} IPs __________"
+                    )
+                    most_common_ips = ips["top"][key]
+                    if most_common_ips:
+                        for place, most_common_data in enumerate(
+                            most_common_ips, start=1
+                        ):
+                            lines.append(
+                                f"{place:>2}. | {most_common_data['ip']:<15} | {most_common_data['count']}x"
+                            )
+                    else:
+                        lines.append("(no IPs found)")
+                lines.append("")
+
+            lines += [
+                "__________ Results __________",
+                (
+                    f"Using IPsum list level {params['ipsum_level']} "
+                    f"({processed['blacklisted_count']} IPs):"
+                ),
+                (
+                    f"  {entries['blocked_ratio'] * 100: >6.2f}% entries would be blocked "
+                    f"({entries['blocked_count']} out of {entries['total_count']}, "
+                    f"unblocked: {entries['unblocked_count']})"
+                ),
+                (
+                    f"  {ips['blocked_ratio'] * 100: >6.2f}% unique IPs "
+                    f"would be blocked "
+                    f"({ips['blocked_count']} out of {ips['total_count']}, "
+                    f"unblocked: {ips['unblocked_count']})"
+                ),
+            ]
+        else:
+            lines += [
+                "",
+                "__________ Results __________",
+                (
+                    "No entries with IPs or IP on position {ippos}{terms} found".format(
+                        ippos=params["n_th_ip"],
+                        terms=(
+                            " and given search terms"
+                            if processed["search_terms"]
+                            else ""
+                        ),
+                    )
+                ),
+            ]
+
+        return os.linesep.join(lines)
 
 
 def main() -> None:
@@ -350,11 +864,11 @@ def main() -> None:
         "-L",
         "--older-logs-up-to-n",
         type=int,
-        default=1,
+        default=0,
         metavar="NUMBER",
         help=(
             "If text file has '.log' as extension (case insensitive), also "
-            "look for older (possibly comressed) log files like "
+            "look for older (possibly compressed) log files like "
             "<file>.1, <file>.2.lzma, "
             "<file>.3.gz, ...,  <file>.<THIS_NUMBER>.bz2 etc.; use 0 to "
             "disable this behaviour"
@@ -456,8 +970,37 @@ def main() -> None:
         metavar="NUMBER",
         help=("Print this many top matches in results; use 0 to omit"),
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output result in JSON format to stdout",
+    )
+    parser.add_argument(
+        "--threads",
+        type=str,
+        default="1",
+        help=(
+            "process multiple files in parallel using this many threads; "
+            "often this is not faster; 1 means no multithreading; use "
+            "'auto' to use a reasonable number of threads "
+            "(EXPERIMENTAL)"
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print version number and exit",
+    )
 
     args = parser.parse_args()
+
+    if args.version:
+        print(__version__)
+        sys.exit(0)
+
+    for input_file in args.input_file:
+        if not input_file.is_file():
+            parser.error(f"Input file does not exist: {input_file}")
 
     if args.n_th_ip == 0:
         parser.error("--n-th-ip must not be 0")
@@ -468,236 +1011,34 @@ def main() -> None:
     if args.top_n < 0:
         parser.error("--top-n must not be negative")
 
-    for input_file in args.input_file:
-        if not input_file.is_file():
-            parser.error(f"Input file does not exist: {input_file}")
-
-    # First, download or update the block list
-    tempdir_path = Path(tempfile.gettempdir())
-    ipsum_block_file_path = (
-        tempdir_path
-        / f"ipsum_log_block_check__{getpass.getuser()}"
-        / f"ipsum_blocked_ips__level_{args.ipsum_level}.txt"
-    )
-
-    ipsum_datetime: datetime | None = None
-    ipsum_list_needs_download = False
-    ipsum_blocked_ips_text = ""
-
-    if ipsum_block_file_path.is_file() and not is_file_older_than(
-        file_path=ipsum_block_file_path, delta=timedelta(minutes=args.ipsum_max_age)
-    ):
-        try:
-            ipsum_blocked_ips_text = ipsum_block_file_path.read_text(encoding="utf-8")
-            ipsum_datetime = datetime.fromtimestamp(
-                ipsum_block_file_path.stat().st_mtime
-            )
-        except Exception as e:
-            ipsum_list_needs_download = True
-            print(
-                f"Failed to read cache file {ipsum_block_file_path}: {e}",
-                file=sys.stderr,
-            )
-    else:
-        ipsum_list_needs_download = True
-
-    if ipsum_list_needs_download:
-        try:
-            # Download list
-            ipsum_blocked_ips_text = download_textfile(
-                IPSET_URL_FORMAT_STR.format(level=args.ipsum_level)
-            )
-            ipsum_datetime = datetime.now()
-            # Try to save list to cache file
-            try:
-                if not ipsum_block_file_path.parent.is_dir():
-                    ipsum_block_file_path.parent.mkdir(parents=True)
-                ipsum_block_file_path.write_text(
-                    ipsum_blocked_ips_text, encoding="utf-8"
-                )
-            except OSError:
-                # Not a deal-breaker, we just use the downloaded list in memory
-                print(
-                    f"Failed to write cache file to {ipsum_block_file_path}",
-                    file=sys.stderr,
-                )
-        except Exception as e:
-            print(f"Failed to get IPsum block list: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    # Build the block list and ensure it is valid
-    ipsum_blocked_ips: set[str] = set()
-    try:
-        for line_nr, line in enumerate(ipsum_blocked_ips_text.split(), start=1):
-            line = line.strip()
-            if not line:
-                continue
-            if not line.startswith("#") and IP4_REGEX.fullmatch(line):
-                ipsum_blocked_ips.add(line)
-            else:
-                print(
-                    f"IPsum block list contains invalid IP address at line #{line_nr}: {line}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-    except Exception as e:
-        print(f"Failed to parse IPsum block list: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Get text file paths
-    text_file_paths = get_text_file_paths(
-        args.input_file,
-        older_logs_upto_n=args.older_logs_up_to_n,
-        sort_by_mtime=args.process_by_mtime,
-    )
-
-    # Build search terms
-    search_terms: set[SearchTerm] = set()
-    terms_data = (
-        (args.include_term_case_insensitive, SearchTermKind.INCLUDE, False),
-        (args.include_term_case_sensitive, SearchTermKind.INCLUDE, True),
-        (args.exclude_term_case_insensitive, SearchTermKind.EXCLUDE, False),
-        (args.exclude_term_case_sensitive, SearchTermKind.EXCLUDE, True),
-    )
-    for terms, kind, case_sensitive in terms_data:
-        for term in terms or []:
-            search_terms.add(
-                SearchTerm(term=term, kind=kind, case_sensitive=case_sensitive)
-            )
-
-    # Get matches
-    ip_matches = do_search(
-        text_file_paths=text_file_paths,
-        search_terms=search_terms,
-        n_th_ip=args.n_th_ip,
-        encoding=args.encoding,
-    )
-
-    # Print matches
-    output_string_min_length = 28
-    try:
-        terminal_width = os.get_terminal_size().columns
-    except OSError:
-        terminal_width = None
-    width_available = (
-        (terminal_width - output_string_min_length - 1) if terminal_width else None
-    )
-
-    all_ips: list[str] = []
-    blocked_ips: list[str] = []
-    unblocked_ips: list[str] = []
-    for ip_match in ip_matches:
-        all_ips.append(ip_match.ip)
-
-        is_blocked = ip_match.ip in ipsum_blocked_ips
-        if is_blocked:
-            blocked_ips.append(ip_match.ip)
+    threads = 1
+    if args.threads:
+        if args.threads.lower() == "auto":
+            threads = None
         else:
-            unblocked_ips.append(ip_match.ip)
+            try:
+                threads = int(args.threads)
+                if threads < 1:
+                    raise ValueError
+            except ValueError:
+                parser.error("--threads must be an integer >= 1 or 'auto'")
 
-        omit_print = (is_blocked and args.no_blocked) or (not is_blocked and args.no_ok)
-        if not omit_print:
-            print(
-                "{0:>7} | {1:<15} | {2}".format(
-                    "BLOCKED" if is_blocked else "OK",
-                    ip_match.ip,
-                    fit_line_with_ellipsis(
-                        line=TAB_REGEX.sub(" ", ip_match.line),
-                        max_width=width_available,
-                    ),
-                )
-            )
+    kwargs = vars(args)
 
-    # Output used parameters and results
-    blocked_count = len(blocked_ips)
-    unique_blocked_count = len(set(blocked_ips))
-    unblocked_count = len(unblocked_ips)
-    unique_unblocked_count = len(set(unblocked_ips))
-    all_count = len(all_ips)
-    all_unique_count = len(set(all_ips))
+    as_json = kwargs.pop("json")
+    kwargs.pop("threads")
+    kwargs.pop("version")
+    if as_json:
+        kwargs["no_ok"] = True
+        kwargs["no_blocked"] = True
+    block_list_search = BlockListSearch(**kwargs)
 
-    print()
-    print("__________ Params __________")
-    print(
-        f"IPsum list level {args.ipsum_level} (containing {len(ipsum_blocked_ips)} IPs)"
-    )
-    print(f"IPsum list cache file: {ipsum_block_file_path}")
-    print(f"IPsum list date: {ipsum_datetime.isoformat() if ipsum_datetime else '-'}")
+    block_list_search.parse(threads=threads)
 
-    print(f"Log file(s) parsed ({len(text_file_paths)}):")
-    for i, text_file_path in enumerate(text_file_paths, start=1):
-        print(f"{i:>4}. {text_file_path.resolve()}")
-
-    print(f"Looking at IP number {args.n_th_ip} in each line")
-
-    print("Search term(s):")
-    if search_terms:
-        for i, search_term in enumerate(search_terms, start=1):
-            print(
-                "{0:>4}. {1} {2:>16}: {3}".format(
-                    i,
-                    "+" if search_term.kind == SearchTermKind.INCLUDE else "-",
-                    "case sensitive"
-                    if search_term.case_sensitive
-                    else "case insensitive",
-                    search_term.term,
-                )
-            )
+    if as_json:
+        print(block_list_search.get_result_as_json())
     else:
-        print("(no search terms given)")
-
-    if all_unique_count:
-        if args.top_n > 0:
-            print()
-            print(f"__________ Top {args.top_n} total IPs __________")
-            most_common_total_ips = Counter(all_ips).most_common(args.top_n)
-            if most_common_total_ips:
-                for place, (ip, count) in enumerate(most_common_total_ips, start=1):
-                    print(f"{place:>2}. | {ip:<15} | {count}x")
-            else:
-                print("(no IPs found)")
-
-            print(f"__________ Top {args.top_n} unblocked IPs __________")
-            most_common_unblocked_ips = Counter(unblocked_ips).most_common(args.top_n)
-            if most_common_unblocked_ips:
-                for place, (ip, count) in enumerate(most_common_unblocked_ips, start=1):
-                    print(f"{place:>2}. | {ip:<15} | {count}x")
-            else:
-                print("(no IPs found)")
-
-            print(f"__________ Top {args.top_n} blocked IPs __________")
-            most_common_blocked_ips = Counter(blocked_ips).most_common(args.top_n)
-            if most_common_blocked_ips:
-                for place, (ip, count) in enumerate(most_common_blocked_ips, start=1):
-                    print(f"{place:>2}. | {ip:<15} | {count}x")
-            else:
-                print("(no IPs found)")
-            print()
-
-        print("__________ Results __________")
-        print(
-            f"Using IPsum list level {args.ipsum_level} ({len(ipsum_blocked_ips)} IPs):"
-        )
-        print(
-            f"  {blocked_count / all_count: >7.2%} entries would be blocked "
-            f"({blocked_count} out of {all_count}, "
-            f"unblocked: {unblocked_count})"
-        )
-        print(
-            f"  {unique_blocked_count / all_unique_count: >7.2%} unique IPs "
-            f"would be blocked "
-            f"({unique_blocked_count} out of {all_unique_count}, "
-            f"unblocked: {unique_unblocked_count})"
-        )
-    else:
-        print()
-        print("__________ Results __________")
-        print(
-            "No entries with IPs or IP on position {ippos}{terms} found".format(
-                ippos=args.n_th_ip,
-                terms=(" and given search terms" if search_terms else ""),
-            )
-        )
+        print(block_list_search.get_result_as_str())
 
 
 if __name__ == "__main__":
